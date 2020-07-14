@@ -204,8 +204,7 @@ func (s *mspan) nextFreeIndex() uintptr {
 
 	aCache := s.allocCache
 
-	bitIndex := sys.Ctz64(aCache)
-	for bitIndex == 64 {
+	for aCache == 0 {
 		// Move index to start of next cached bits.
 		sfreeindex = (sfreeindex + 64) &^ (64 - 1)
 		if sfreeindex >= snelems {
@@ -216,9 +215,11 @@ func (s *mspan) nextFreeIndex() uintptr {
 		// Refill s.allocCache with the next 64 alloc bits.
 		s.refillAllocCache(whichByte)
 		aCache = s.allocCache
-		bitIndex = sys.Ctz64(aCache)
-		// nothing available in cached bits
-		// grab the next 8 bytes and try again.
+	}
+	bitIndex := sys.Ctz64(aCache)
+	// bitIndex should not be 64 here
+	if bitIndex == 64 {
+		throw("bitIndex == 64, aCache != 0")
 	}
 	result := sfreeindex + uintptr(bitIndex)
 	if result >= snelems {
