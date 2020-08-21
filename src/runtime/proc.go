@@ -2189,7 +2189,8 @@ top:
 		runSafePointFn()
 	}
 
-	now, pollUntil, _ := checkTimers(_p_, 0)
+	ntime := nanotime()
+	now, pollUntil, _ := checkTimers(_p_, ntime)
 
 	if fingwait && fingwake {
 		if gp := wakefing(); gp != nil {
@@ -2237,6 +2238,7 @@ top:
 	// Steal work from other P's.
 	procs := uint32(gomaxprocs)
 	ranTimer := false
+	stealLeaseDeadline := atomic.Loadint64(&sched.workStealLeaseDeadline)
 	// If number of spinning M's >= number of busy P's, block.
 	// This is necessary to prevent excessive CPU consumption
 	// when GOMAXPROCS>>1 but the program parallelism is low.
@@ -2246,6 +2248,10 @@ top:
 	if !_g_.m.spinning {
 		_g_.m.spinning = true
 		atomic.Xadd(&sched.nmspinning, 1)
+	}
+	// don't steal in steal lease time
+	if ntime < stealLeaseDeadline {
+		goto stop
 	}
 	for i := 0; i < 4; i++ {
 		for enum := stealOrder.start(fastrand()); !enum.done(); enum.next() {
@@ -2298,6 +2304,8 @@ top:
 		// Running a timer may have made some goroutine ready.
 		goto top
 	}
+	// haven't stolen anything, set work steal lease deadline
+	atomic.Store64((*uint64)(unsafe.Pointer(&sched.workStealLeaseDeadline)), uint64(ntime+workStealLeaseDuration))
 
 stop:
 
@@ -2381,20 +2389,22 @@ stop:
 	}
 
 	// check all runqueues once again
-	for _, _p_ := range allpSnapshot {
-		if !runqempty(_p_) {
-			lock(&sched.lock)
-			_p_ = pidleget()
-			unlock(&sched.lock)
-			if _p_ != nil {
-				acquirep(_p_)
-				if wasSpinning {
-					_g_.m.spinning = true
-					atomic.Xadd(&sched.nmspinning, 1)
+	if ntime >= stealLeaseDeadline {
+		for _, _p_ := range allpSnapshot {
+			if !runqempty(_p_) {
+				lock(&sched.lock)
+				_p_ = pidleget()
+				unlock(&sched.lock)
+				if _p_ != nil {
+					acquirep(_p_)
+					if wasSpinning {
+						_g_.m.spinning = true
+						atomic.Xadd(&sched.nmspinning, 1)
+					}
+					goto top
 				}
-				goto top
+				break
 			}
-			break
 		}
 	}
 
@@ -4621,6 +4631,9 @@ func checkdead() {
 // This is a variable for testing purposes. It normally doesn't change.
 var forcegcperiod int64 = 2 * 60 * 1e9
 
+// 3 ms
+const workStealLeaseDuration = 3 * 1000 * 1000
+
 // Always runs without a P, so write barriers are not allowed.
 //
 //go:nowritebarrierrec
@@ -4710,11 +4723,12 @@ func sysmon() {
 				incidlelocked(1)
 			}
 		}
-		if next < now {
+		if next < now || delay * 1000 > workStealLeaseDuration {
 			// There are timers that should have already run,
 			// perhaps because there is an unpreemptible P.
 			// Try to start an M to run them.
 			startm(nil, false)
+			idle = 0
 		}
 		if atomic.Load(&scavenge.sysmonWake) != 0 {
 			// Kick the scavenger awake if someone requested it.
