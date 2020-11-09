@@ -231,6 +231,13 @@ func walkstmt(n *Node) *Node {
 		case OCOPY:
 			n.Left = copyany(n.Left, &n.Ninit, true)
 
+		case OCALLFUNC, OCALLMETH, OCALLINTER:
+			if n.Left.Nbody.Len() > 0 {
+				n.Left = wrapCall(n.Left, &n.Ninit)
+			} else {
+				n.Left = walkexpr(n.Left, &n.Ninit)
+			}
+
 		default:
 			n.Left = walkexpr(n.Left, &n.Ninit)
 		}
@@ -381,9 +388,9 @@ func convFuncName(from, to *types.Type) (fnname string, needsaddr bool) {
 		switch {
 		case from.Size() == 2 && from.Align == 2:
 			return "convT16", false
-		case from.Size() == 4 && from.Align == 4 && !types.Haspointers(from):
+		case from.Size() == 4 && from.Align == 4 && !from.HasPointers():
 			return "convT32", false
-		case from.Size() == 8 && from.Align == types.Types[TUINT64].Align && !types.Haspointers(from):
+		case from.Size() == 8 && from.Align == types.Types[TUINT64].Align && !from.HasPointers():
 			return "convT64", false
 		}
 		if sc := from.SoleComponent(); sc != nil {
@@ -397,12 +404,12 @@ func convFuncName(from, to *types.Type) (fnname string, needsaddr bool) {
 
 		switch tkind {
 		case 'E':
-			if !types.Haspointers(from) {
+			if !from.HasPointers() {
 				return "convT2Enoptr", true
 			}
 			return "convT2E", true
 		case 'I':
-			if !types.Haspointers(from) {
+			if !from.HasPointers() {
 				return "convT2Inoptr", true
 			}
 			return "convT2I", true
@@ -641,7 +648,7 @@ opswitch:
 			// x = append(...)
 			r := n.Right
 			if r.Type.Elem().NotInHeap() {
-				yyerror("%v is go:notinheap; heap allocation disallowed", r.Type.Elem())
+				yyerror("%v can't be allocated in Go; it is incomplete (or unallocatable)", r.Type.Elem())
 			}
 			switch {
 			case isAppendOfMake(r):
@@ -954,11 +961,11 @@ opswitch:
 	case OCONV, OCONVNOP:
 		n.Left = walkexpr(n.Left, init)
 		if n.Op == OCONVNOP && checkPtr(Curfn, 1) {
-			if n.Type.IsPtr() && n.Left.Type.Etype == TUNSAFEPTR { // unsafe.Pointer to *T
+			if n.Type.IsPtr() && n.Left.Type.IsUnsafePtr() { // unsafe.Pointer to *T
 				n = walkCheckPtrAlignment(n, init, nil)
 				break
 			}
-			if n.Type.Etype == TUNSAFEPTR && n.Left.Type.Etype == TUINTPTR { // uintptr to unsafe.Pointer
+			if n.Type.IsUnsafePtr() && n.Left.Type.IsUintptr() { // uintptr to unsafe.Pointer
 				n = walkCheckPtrArithmetic(n, init)
 				break
 			}
@@ -1123,7 +1130,7 @@ opswitch:
 		n.List.SetSecond(walkexpr(n.List.Second(), init))
 
 	case OSLICE, OSLICEARR, OSLICESTR, OSLICE3, OSLICE3ARR:
-		checkSlice := checkPtr(Curfn, 1) && n.Op == OSLICE3ARR && n.Left.Op == OCONVNOP && n.Left.Left.Type.Etype == TUNSAFEPTR
+		checkSlice := checkPtr(Curfn, 1) && n.Op == OSLICE3ARR && n.Left.Op == OCONVNOP && n.Left.Left.Type.IsUnsafePtr()
 		if checkSlice {
 			n.Left.Left = walkexpr(n.Left.Left, init)
 		} else {
@@ -1156,6 +1163,9 @@ opswitch:
 		}
 
 	case ONEW:
+		if n.Type.Elem().NotInHeap() {
+			yyerror("%v can't be allocated in Go; it is incomplete (or unallocatable)", n.Type.Elem())
+		}
 		if n.Esc == EscNone {
 			if n.Type.Elem().Width >= maxImplicitStackVarSize {
 				Fatalf("large ONEW with EscNone: %v", n)
@@ -1324,6 +1334,9 @@ opswitch:
 			l = r
 		}
 		t := n.Type
+		if t.Elem().NotInHeap() {
+			yyerror("%v can't be allocated in Go; it is incomplete (or unallocatable)", t.Elem())
+		}
 		if n.Esc == EscNone {
 			if !isSmallMakeSlice(n) {
 				Fatalf("non-small OMAKESLICE with EscNone: %v", n)
@@ -1365,10 +1378,6 @@ opswitch:
 			// When len and cap can fit into int, use makeslice instead of
 			// makeslice64, which is faster and shorter on 32 bit platforms.
 
-			if t.Elem().NotInHeap() {
-				yyerror("%v is go:notinheap; heap allocation disallowed", t.Elem())
-			}
-
 			len, cap := l, r
 
 			fnname := "makeslice64"
@@ -1403,14 +1412,14 @@ opswitch:
 
 		t := n.Type
 		if t.Elem().NotInHeap() {
-			Fatalf("%v is go:notinheap; heap allocation disallowed", t.Elem())
+			yyerror("%v can't be allocated in Go; it is incomplete (or unallocatable)", t.Elem())
 		}
 
 		length := conv(n.Left, types.Types[TINT])
 		copylen := nod(OLEN, n.Right, nil)
 		copyptr := nod(OSPTR, n.Right, nil)
 
-		if !types.Haspointers(t.Elem()) && n.Bounded() {
+		if !t.Elem().HasPointers() && n.Bounded() {
 			// When len(to)==len(from) and elements have no pointers:
 			// replace make+copy with runtime.mallocgc+runtime.memmove.
 
@@ -1475,7 +1484,7 @@ opswitch:
 		} else {
 			// slicebytetostring(*[32]byte, ptr *byte, n int) string
 			n.Left = cheapexpr(n.Left, init)
-			ptr, len := n.Left.slicePtrLen()
+			ptr, len := n.Left.backingArrayPtrLen()
 			n = mkcall("slicebytetostring", n.Type, init, a, ptr, len)
 		}
 
@@ -1488,7 +1497,7 @@ opswitch:
 		}
 		// slicebytetostringtmp(ptr *byte, n int) string
 		n.Left = cheapexpr(n.Left, init)
-		ptr, len := n.Left.slicePtrLen()
+		ptr, len := n.Left.backingArrayPtrLen()
 		n = mkcall("slicebytetostringtmp", n.Type, init, ptr, len)
 
 	case OSTR2BYTES:
@@ -2012,9 +2021,6 @@ func walkprint(nn *Node, init *Nodes) *Node {
 }
 
 func callnew(t *types.Type) *Node {
-	if t.NotInHeap() {
-		yyerror("%v is go:notinheap; heap allocation disallowed", t)
-	}
 	dowidth(t)
 	n := nod(ONEWOBJ, typename(t), nil)
 	n.Type = types.NewPtr(t)
@@ -2589,7 +2595,7 @@ func mapfast(t *types.Type) int {
 	}
 	switch algtype(t.Key()) {
 	case AMEM32:
-		if !t.Key().HasHeapPointer() {
+		if !t.Key().HasPointers() {
 			return mapfast32
 		}
 		if Widthptr == 4 {
@@ -2597,7 +2603,7 @@ func mapfast(t *types.Type) int {
 		}
 		Fatalf("small pointer %v", t.Key())
 	case AMEM64:
-		if !t.Key().HasHeapPointer() {
+		if !t.Key().HasPointers() {
 			return mapfast64
 		}
 		if Widthptr == 8 {
@@ -2744,7 +2750,7 @@ func appendslice(n *Node, init *Nodes) *Node {
 	nodes.Append(nod(OAS, s, nt))
 
 	var ncopy *Node
-	if elemtype.HasHeapPointer() {
+	if elemtype.HasPointers() {
 		// copy(s[len(l1):], l2)
 		nptr1 := nod(OSLICE, s, nil)
 		nptr1.Type = s.Type
@@ -2758,36 +2764,25 @@ func appendslice(n *Node, init *Nodes) *Node {
 		// instantiate typedslicecopy(typ *type, dstPtr *any, dstLen int, srcPtr *any, srcLen int) int
 		fn := syslook("typedslicecopy")
 		fn = substArgTypes(fn, l1.Type.Elem(), l2.Type.Elem())
-		ptr1, len1 := nptr1.slicePtrLen()
-		ptr2, len2 := nptr2.slicePtrLen()
+		ptr1, len1 := nptr1.backingArrayPtrLen()
+		ptr2, len2 := nptr2.backingArrayPtrLen()
 		ncopy = mkcall1(fn, types.Types[TINT], &nodes, typename(elemtype), ptr1, len1, ptr2, len2)
-
 	} else if instrumenting && !compiling_runtime {
-		// rely on runtime to instrument copy.
-		// copy(s[len(l1):], l2)
+		// rely on runtime to instrument:
+		//  copy(s[len(l1):], l2)
+		// l2 can be a slice or string.
 		nptr1 := nod(OSLICE, s, nil)
 		nptr1.Type = s.Type
 		nptr1.SetSliceBounds(nod(OLEN, l1, nil), nil, nil)
 		nptr1 = cheapexpr(nptr1, &nodes)
-
 		nptr2 := l2
 
-		if l2.Type.IsString() {
-			// instantiate func slicestringcopy(toPtr *byte, toLen int, fr string) int
-			fn := syslook("slicestringcopy")
-			ptr, len := nptr1.slicePtrLen()
-			str := nod(OCONVNOP, nptr2, nil)
-			str.Type = types.Types[TSTRING]
-			ncopy = mkcall1(fn, types.Types[TINT], &nodes, ptr, len, str)
-		} else {
-			// instantiate func slicecopy(to any, fr any, wid uintptr) int
-			fn := syslook("slicecopy")
-			fn = substArgTypes(fn, l1.Type.Elem(), l2.Type.Elem())
-			ptr1, len1 := nptr1.slicePtrLen()
-			ptr2, len2 := nptr2.slicePtrLen()
-			ncopy = mkcall1(fn, types.Types[TINT], &nodes, ptr1, len1, ptr2, len2, nodintconst(elemtype.Width))
-		}
+		ptr1, len1 := nptr1.backingArrayPtrLen()
+		ptr2, len2 := nptr2.backingArrayPtrLen()
 
+		fn := syslook("slicecopy")
+		fn = substArgTypes(fn, ptr1.Type.Elem(), ptr2.Type.Elem())
+		ncopy = mkcall1(fn, types.Types[TINT], &nodes, ptr1, len1, ptr2, len2, nodintconst(elemtype.Width))
 	} else {
 		// memmove(&s[len(l1)], &l2[0], len(l2)*sizeof(T))
 		nptr1 := nod(OINDEX, s, nod(OLEN, l1, nil))
@@ -2865,7 +2860,7 @@ func isAppendOfMake(n *Node) bool {
 //     s = s[:n]
 //     lptr := &l1[0]
 //     sptr := &s[0]
-//     if lptr == sptr || !hasPointers(T) {
+//     if lptr == sptr || !T.HasPointers() {
 //       // growslice did not clear the whole underlying array (or did not get called)
 //       hp := &s[len(l1)]
 //       hn := l2 * sizeof(T)
@@ -2946,7 +2941,7 @@ func extendslice(n *Node, init *Nodes) *Node {
 	hn = conv(hn, types.Types[TUINTPTR])
 
 	clrname := "memclrNoHeapPointers"
-	hasPointers := types.Haspointers(elemtype)
+	hasPointers := elemtype.HasPointers()
 	if hasPointers {
 		clrname = "memclrHasPointers"
 		Curfn.Func.setWBPos(n.Pos)
@@ -3082,32 +3077,29 @@ func walkappend(n *Node, init *Nodes, dst *Node) *Node {
 // Also works if b is a string.
 //
 func copyany(n *Node, init *Nodes, runtimecall bool) *Node {
-	if n.Left.Type.Elem().HasHeapPointer() {
+	if n.Left.Type.Elem().HasPointers() {
 		Curfn.Func.setWBPos(n.Pos)
 		fn := writebarrierfn("typedslicecopy", n.Left.Type.Elem(), n.Right.Type.Elem())
 		n.Left = cheapexpr(n.Left, init)
-		ptrL, lenL := n.Left.slicePtrLen()
+		ptrL, lenL := n.Left.backingArrayPtrLen()
 		n.Right = cheapexpr(n.Right, init)
-		ptrR, lenR := n.Right.slicePtrLen()
+		ptrR, lenR := n.Right.backingArrayPtrLen()
 		return mkcall1(fn, n.Type, init, typename(n.Left.Type.Elem()), ptrL, lenL, ptrR, lenR)
 	}
 
 	if runtimecall {
-		if n.Right.Type.IsString() {
-			fn := syslook("slicestringcopy")
-			n.Left = cheapexpr(n.Left, init)
-			ptr, len := n.Left.slicePtrLen()
-			str := nod(OCONVNOP, n.Right, nil)
-			str.Type = types.Types[TSTRING]
-			return mkcall1(fn, n.Type, init, ptr, len, str)
-		}
+		// rely on runtime to instrument:
+		//  copy(n.Left, n.Right)
+		// n.Right can be a slice or string.
+
+		n.Left = cheapexpr(n.Left, init)
+		ptrL, lenL := n.Left.backingArrayPtrLen()
+		n.Right = cheapexpr(n.Right, init)
+		ptrR, lenR := n.Right.backingArrayPtrLen()
 
 		fn := syslook("slicecopy")
-		fn = substArgTypes(fn, n.Left.Type.Elem(), n.Right.Type.Elem())
-		n.Left = cheapexpr(n.Left, init)
-		ptrL, lenL := n.Left.slicePtrLen()
-		n.Right = cheapexpr(n.Right, init)
-		ptrR, lenR := n.Right.slicePtrLen()
+		fn = substArgTypes(fn, ptrL.Type.Elem(), ptrR.Type.Elem())
+
 		return mkcall1(fn, n.Type, init, ptrL, lenL, ptrR, lenR, nodintconst(n.Left.Type.Elem().Width))
 	}
 
@@ -3167,8 +3159,7 @@ func eqfor(t *types.Type) (n *Node, needsize bool) {
 	case ASPECIAL:
 		sym := typesymprefix(".eq", t)
 		n := newname(sym)
-		n.SetClass(PFUNC)
-		n.Sym.SetFunc(true)
+		setNodeNameFunc(n)
 		n.Type = functype(nil, []*Node{
 			anonfield(types.NewPtr(t)),
 			anonfield(types.NewPtr(t)),
@@ -3859,6 +3850,14 @@ func candiscard(n *Node) bool {
 //		builtin(a1, a2, a3)
 //	}(x, y, z)
 // for print, println, and delete.
+//
+// Rewrite
+//	go f(x, y, uintptr(unsafe.Pointer(z)))
+// into
+//	go func(a1, a2, a3) {
+//		builtin(a1, a2, uintptr(a3))
+//	}(x, y, unsafe.Pointer(z))
+// for function contains unsafe-uintptr arguments.
 
 var wrapCall_prgen int
 
@@ -3870,9 +3869,17 @@ func wrapCall(n *Node, init *Nodes) *Node {
 		init.AppendNodes(&n.Ninit)
 	}
 
+	isBuiltinCall := n.Op != OCALLFUNC && n.Op != OCALLMETH && n.Op != OCALLINTER
+	// origArgs keeps track of what argument is uintptr-unsafe/unsafe-uintptr conversion.
+	origArgs := make([]*Node, n.List.Len())
 	t := nod(OTFUNC, nil, nil)
 	for i, arg := range n.List.Slice() {
 		s := lookupN("a", i)
+		if !isBuiltinCall && arg.Op == OCONVNOP && arg.Type.IsUintptr() && arg.Left.Type.IsUnsafePtr() {
+			origArgs[i] = arg
+			arg = arg.Left
+			n.List.SetIndex(i, arg)
+		}
 		t.List.Append(symfield(s, arg.Type))
 	}
 
@@ -3880,10 +3887,23 @@ func wrapCall(n *Node, init *Nodes) *Node {
 	sym := lookupN("wrap·", wrapCall_prgen)
 	fn := dclfunc(sym, t)
 
-	a := nod(n.Op, nil, nil)
-	a.List.Set(paramNnames(t.Type))
-	a = typecheck(a, ctxStmt)
-	fn.Nbody.Set1(a)
+	args := paramNnames(t.Type)
+	for i, origArg := range origArgs {
+		if origArg == nil {
+			continue
+		}
+		arg := nod(origArg.Op, args[i], nil)
+		arg.Type = origArg.Type
+		args[i] = arg
+	}
+	call := nod(n.Op, nil, nil)
+	if !isBuiltinCall {
+		call.Op = OCALL
+		call.Left = n.Left
+		call.SetIsDDD(n.IsDDD())
+	}
+	call.List.Set(args)
+	fn.Nbody.Set1(call)
 
 	funcbody()
 
@@ -3891,12 +3911,12 @@ func wrapCall(n *Node, init *Nodes) *Node {
 	typecheckslice(fn.Nbody.Slice(), ctxStmt)
 	xtop = append(xtop, fn)
 
-	a = nod(OCALL, nil, nil)
-	a.Left = fn.Func.Nname
-	a.List.Set(n.List.Slice())
-	a = typecheck(a, ctxStmt)
-	a = walkexpr(a, init)
-	return a
+	call = nod(OCALL, nil, nil)
+	call.Left = fn.Func.Nname
+	call.List.Set(n.List.Slice())
+	call = typecheck(call, ctxStmt)
+	call = walkexpr(call, init)
+	return call
 }
 
 // substArgTypes substitutes the given list of types for
@@ -4011,7 +4031,7 @@ func walkCheckPtrArithmetic(n *Node, init *Nodes) *Node {
 				walk(n.Left)
 			}
 		case OCONVNOP:
-			if n.Left.Type.Etype == TUNSAFEPTR {
+			if n.Left.Type.IsUnsafePtr() {
 				n.Left = cheapexpr(n.Left, init)
 				originals = append(originals, convnop(n.Left, types.Types[TUNSAFEPTR]))
 			}
